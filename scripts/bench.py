@@ -4,9 +4,11 @@
 Each server starts from an empty data directory, single node, on this
 machine. Two durability modes:
 
-  fsync  every acknowledged batch has been fsynced (plain fsync(2)):
-         riverlog -sync always -fsync plain, Kafka topic flush.messages=1,
-         NATS jetstream sync_interval: always
+  fsync  every acknowledged batch is on stable storage (F_FULLFSYNC on
+         macOS for all three: Go's File.Sync, and Java's FileChannel.force
+         since JDK 9): riverlog -sync always, Kafka topic flush.messages=1,
+         NATS jetstream sync_interval: always.
+         Also riverlog with plain fsync(2) ("riverlog-plain"), for reference.
   async  acknowledged when written to the OS:
          riverlog -sync never, Kafka defaults, NATS defaults
 
@@ -30,11 +32,16 @@ KAFKA = subprocess.run(["brew", "--prefix", "kafka"], capture_output=True, text=
 
 WORKLOADS = [
     # name, rlbench args
-    ("1 producer, 1 partition, 100 B", ["-mode", "throughput", "-producers", "1", "-partitions", "1", "-size", "100", "-records", "2000000"]),
-    ("4 producers, 4 partitions, 100 B", ["-mode", "throughput", "-producers", "4", "-partitions", "4", "-size", "100", "-records", "1000000"]),
-    ("4 producers, 4 partitions, 1 KiB", ["-mode", "throughput", "-producers", "4", "-partitions", "4", "-size", "1024", "-records", "250000"]),
-    ("latency at 10k records/s", ["-mode", "latency", "-partitions", "1", "-size", "100", "-rate", "10000", "-duration", "10s"]),
+    ("1 producer, 1 partition, 100 B", ["-mode", "throughput", "-producers", "1", "-partitions", "1", "-size", "100", "-duration", "10s"]),
+    ("4 producers, 4 partitions, 100 B", ["-mode", "throughput", "-producers", "4", "-partitions", "4", "-size", "100", "-duration", "10s"]),
+    ("4 producers, 4 partitions, 1 KiB", ["-mode", "throughput", "-producers", "4", "-partitions", "4", "-size", "1024", "-duration", "10s"]),
 ]
+# Latency is measured at a rate every system sustains in that mode (NATS with
+# per-message F_FULLFSYNC manages a few hundred records/s).
+LATENCY = {
+    "fsync": ("latency at 200 records/s", ["-mode", "latency", "-partitions", "1", "-size", "100", "-rate", "200", "-duration", "10s"]),
+    "async": ("latency at 10k records/s", ["-mode", "latency", "-partitions", "1", "-size", "100", "-rate", "10000", "-duration", "10s"]),
+}
 
 
 def wait_port(port, timeout=60):
@@ -57,8 +64,8 @@ def stop(p):
         p.wait()
 
 
-def start_riverlog(d, durability):
-    args = ["-sync", "always", "-fsync", "plain"] if durability == "fsync" else ["-sync", "never"]
+def start_riverlog(d, durability, fsync="full"):
+    args = ["-sync", "always", "-fsync", fsync] if durability == "fsync" else ["-sync", "never"]
     p = subprocess.Popen([f"{BIN}/riverlog", "-addr", "127.0.0.1:9192", "-dir", d, *args], stderr=subprocess.DEVNULL)
     wait_port(9192)
     return p
@@ -88,12 +95,18 @@ def start_nats(d, durability):
     return p
 
 
-STARTERS = {"riverlog": start_riverlog, "kafka": start_kafka, "nats": start_nats}
+STARTERS = {
+    "riverlog": start_riverlog,
+    "riverlog-plain": lambda d, dur: start_riverlog(d, dur, "plain"),
+    "kafka": start_kafka,
+    "nats": start_nats,
+}
 
 
 def run(system, durability, args):
     extra = ["-kafka-fsync"] if system == "kafka" and durability == "fsync" else []
-    out = subprocess.run([f"{BIN}/rlbench", "-system", system, *args, *extra], check=True, capture_output=True, text=True, timeout=900)
+    sysname = "riverlog" if system == "riverlog-plain" else system
+    out = subprocess.run([f"{BIN}/rlbench", "-system", sysname, *args, *extra], check=True, capture_output=True, text=True, timeout=900)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
@@ -109,12 +122,13 @@ def main():
     }
     rows = []
     for durability in ["fsync", "async"]:
-        for system in ["riverlog", "kafka", "nats"]:
+        systems = ["riverlog", "riverlog-plain", "kafka", "nats"] if durability == "fsync" else ["riverlog", "kafka", "nats"]
+        for system in systems:
             # One server per (system, durability); each run uses a fresh topic.
             d = tempfile.mkdtemp(prefix=f"rlbench-{system}-")
             p = STARTERS[system](d, durability)
             try:
-                for name, args in WORKLOADS:
+                for name, args in WORKLOADS + [LATENCY[durability]]:
                     samples = [run(system, durability, args) for _ in range(RUNS)]
                     med = lambda k: statistics.median(s[k] for s in samples)
                     row = {"system": system, "durability": durability, "workload": name,

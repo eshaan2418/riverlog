@@ -3,8 +3,8 @@
 //
 //	rlbench -system riverlog|kafka|nats -mode throughput|latency [flags]
 //
-// throughput: P producers send N records of S bytes as fast as acks allow
-// (async, batched); reports records/s, MB/s and ack latency percentiles.
+// throughput: P producers send S-byte records for a fixed time with a
+// bounded number unacknowledged; reports records/s, MB/s and ack latency.
 // latency: one producer sends at a fixed rate; a consumer reads; reports
 // produce-to-consume latency percentiles.
 //
@@ -33,19 +33,19 @@ import (
 )
 
 var (
-	system     = flag.String("system", "riverlog", "riverlog | kafka | nats")
-	addr       = flag.String("addr", "", "server address (default per system)")
-	mode       = flag.String("mode", "throughput", "throughput | latency")
-	topic      = flag.String("topic", "", "topic/stream name (default: unique per run)")
-	partitions = flag.Int("partitions", 1, "partitions (riverlog, kafka); NATS streams have one")
-	producers  = flag.Int("producers", 1, "producer goroutines, each with its own connection")
-	records    = flag.Int("records", 1_000_000, "records per producer (throughput)")
-	size       = flag.Int("size", 100, "record value size in bytes")
-	linger     = flag.Duration("linger", time.Millisecond, "producer linger")
-	batchBytes = flag.Int("batch-bytes", 256<<10, "producer batch size")
-	rate       = flag.Int("rate", 10000, "records/s (latency mode)")
-	duration   = flag.Duration("duration", 10*time.Second, "latency mode run time")
-	kafkaFsync = flag.Bool("kafka-fsync", false, "create the Kafka topic with flush.messages=1 (fsync each batch)")
+	system      = flag.String("system", "riverlog", "riverlog | kafka | nats")
+	addr        = flag.String("addr", "", "server address (default per system)")
+	mode        = flag.String("mode", "throughput", "throughput | latency")
+	topic       = flag.String("topic", "", "topic/stream name (default: unique per run)")
+	partitions  = flag.Int("partitions", 1, "partitions (riverlog, kafka); NATS streams have one")
+	producers   = flag.Int("producers", 1, "producer goroutines, each with its own connection")
+	outstanding = flag.Int("outstanding", 65536, "max unacknowledged records per producer (throughput)")
+	size        = flag.Int("size", 100, "record value size in bytes")
+	linger      = flag.Duration("linger", time.Millisecond, "producer linger")
+	batchBytes  = flag.Int("batch-bytes", 256<<10, "producer batch size")
+	rate        = flag.Int("rate", 10000, "records/s (latency mode)")
+	duration    = flag.Duration("duration", 10*time.Second, "run time")
+	kafkaFsync  = flag.Bool("kafka-fsync", false, "create the Kafka topic with flush.messages=1 (fsync each batch)")
 )
 
 type result struct {
@@ -130,11 +130,15 @@ func percentiles(r *result, lat []time.Duration) {
 	r.P50ms, r.P99ms, r.P999ms = at(0.5), at(0.99), at(0.999)
 }
 
+// throughput: each producer sends for -duration, keeping at most
+// -outstanding records unacknowledged (the same cap for every system), then
+// waits for the remaining acks.
 func throughput(d driver) result {
-	var errs atomic.Int64
+	var errs, acked atomic.Int64
 	lats := make([][]time.Duration, *producers)
 	var wg sync.WaitGroup
 	start := time.Now()
+	deadline := start.Add(*duration)
 	for p := 0; p < *producers; p++ {
 		send, flush, err := d.producer()
 		if err != nil {
@@ -143,18 +147,26 @@ func throughput(d driver) result {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			lat := make([]time.Duration, *records)
+			var mu sync.Mutex
+			lat := make([]time.Duration, 0, 1<<20)
 			val := make([]byte, *size)
+			window := make(chan struct{}, *outstanding)
 			var done sync.WaitGroup
-			done.Add(*records)
-			for i := 0; i < *records; i++ {
-				i := i
+			for time.Now().Before(deadline) {
+				window <- struct{}{}
+				done.Add(1)
 				t0 := time.Now()
 				send(val, func(err error) {
+					l := time.Since(t0)
 					if err != nil {
 						errs.Add(1)
+					} else {
+						acked.Add(1)
 					}
-					lat[i] = time.Since(t0)
+					mu.Lock()
+					lat = append(lat, l)
+					mu.Unlock()
+					<-window
 					done.Done()
 				})
 			}
@@ -165,7 +177,7 @@ func throughput(d driver) result {
 	}
 	wg.Wait()
 	secs := time.Since(start).Seconds()
-	n := int64(*records) * int64(*producers)
+	n := acked.Load()
 	r := result{Records: n, Seconds: secs, RecordsPS: float64(n) / secs, MBPS: float64(n) * float64(*size) / secs / 1e6, Errors: errs.Load()}
 	var all []time.Duration
 	for _, l := range lats {
@@ -422,7 +434,7 @@ func (n *natsDriver) producer() (func([]byte, func(error)), func(), error) {
 		return nil, nil, err
 	}
 	n.conns = append(n.conns, nc)
-	js, err := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(4096))
+	js, err := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(*outstanding))
 	if err != nil {
 		return nil, nil, err
 	}

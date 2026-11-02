@@ -36,9 +36,9 @@ type Options struct {
 	Sync           SyncPolicy
 	Interval       time.Duration // for SyncInterval
 	// PlainFsync uses fsync(2) instead of os.File.Sync. They differ only on
-	// macOS, where File.Sync issues F_FULLFSYNC (flush the drive cache) and
-	// plain fsync does not; Java's FileChannel.force, used by Kafka, is a
-	// plain fsync.
+	// macOS, where File.Sync issues F_FULLFSYNC (flush the drive's cache too)
+	// and plain fsync does not. Java's FileChannel.force (used by Kafka) has
+	// also issued F_FULLFSYNC on macOS since JDK 9 (JDK-8080589).
 	PlainFsync bool
 }
 
