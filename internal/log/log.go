@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -34,6 +35,11 @@ type Options struct {
 	RetentionAge   time.Duration // delete segments whose newest record is older (0 = keep all)
 	Sync           SyncPolicy
 	Interval       time.Duration // for SyncInterval
+	// PlainFsync uses fsync(2) instead of os.File.Sync. They differ only on
+	// macOS, where File.Sync issues F_FULLFSYNC (flush the drive cache) and
+	// plain fsync does not; Java's FileChannel.force, used by Kafka, is a
+	// plain fsync.
+	PlainFsync bool
 }
 
 func DefaultOptions() Options {
@@ -243,25 +249,37 @@ func (l *Log) active() *segment { return l.segs[len(l.segs)-1] }
 // Append writes one batch (validated, base offset assigned) and returns its
 // base offset. Under SyncAlways it returns once the batch is durable.
 func (l *Log) Append(batch []byte) (uint64, error) {
-	h, err := Validate(batch)
+	base, end, err := l.AppendNoWait(batch)
 	if err != nil {
 		return 0, err
+	}
+	return base, l.WaitDurable(end)
+}
+
+// AppendNoWait writes the batch and returns its base offset and the offset
+// after it, without waiting for durability. Callers that need durability
+// call WaitDurable(end). Splitting the two lets one connection pipeline
+// appends in order while their fsyncs are shared.
+func (l *Log) AppendNoWait(batch []byte) (base, end uint64, err error) {
+	h, err := Validate(batch)
+	if err != nil {
+		return 0, 0, err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
-		return 0, ErrClosed
+		return 0, 0, ErrClosed
 	}
 	if l.active().size+int64(len(batch)) > l.opts.SegmentBytes && l.active().size > 0 {
 		if err := l.roll(); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 	s := l.active()
-	base := l.next
+	base = l.next
 	SetBaseOffset(batch, base)
 	if _, err := s.f.WriteAt(batch, s.size); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if len(s.index) == 0 || s.sinceIndex >= l.opts.IndexInterval {
 		e := indexEntry{uint32(base - s.base), uint32(s.size)}
@@ -282,26 +300,34 @@ func (l *Log) Append(batch []byte) (uint64, error) {
 	if l.opts.Sync != SyncAlways {
 		l.visible = l.next
 		l.arrived.Broadcast()
-		l.retain()
-		return base, nil
 	}
-	// Group commit: one appender fsyncs everything written so far while
-	// the others wait; whoever finds no sync in flight starts the next.
-	target := l.next
-	for l.durable < target {
+	l.retain()
+	return base, l.next, nil
+}
+
+// WaitDurable blocks until offsets below end are durable (SyncAlways only;
+// other policies return immediately). Group commit: one waiter fsyncs
+// everything written so far while the others wait; whoever finds no sync
+// in flight starts the next one.
+func (l *Log) WaitDurable(end uint64) error {
+	if l.opts.Sync != SyncAlways {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for l.durable < end {
 		if l.closed {
-			return 0, ErrClosed
+			return ErrClosed
 		}
 		if !l.syncing {
 			if err := l.syncLocked(); err != nil {
-				return 0, err
+				return err
 			}
 			continue
 		}
 		l.synced.Wait()
 	}
-	l.retain()
-	return base, nil
+	return nil
 }
 
 // syncLocked fsyncs the active segment with the lock released.
@@ -310,7 +336,7 @@ func (l *Log) syncLocked() error {
 	upTo := l.next
 	f := l.active().f
 	l.mu.Unlock()
-	err := f.Sync()
+	err := l.syncFile(f)
 	l.mu.Lock()
 	l.syncing = false
 	if err != nil {
@@ -328,10 +354,17 @@ func (l *Log) syncLocked() error {
 	return nil
 }
 
+func (l *Log) syncFile(f *os.File) error {
+	if l.opts.PlainFsync {
+		return syscall.Fsync(int(f.Fd()))
+	}
+	return f.Sync()
+}
+
 func (l *Log) roll() error {
 	old := l.active()
 	// The rolled segment must be durable before the next one exists.
-	if err := old.f.Sync(); err != nil {
+	if err := l.syncFile(old.f); err != nil {
 		return err
 	}
 	if err := old.idx.Sync(); err != nil {
